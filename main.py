@@ -1,30 +1,33 @@
 import os
-import requests                      
+import re                              # NEW: regular expressions, used to find PII patterns
+import requests
+import joblib
 from fastapi import FastAPI
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
 
-load_dotenv()  # load all values from your .env file
+load_dotenv()  # load endpoint, key, deployment from your .env file
 
 app = FastAPI()
 
-# Azure Open AI Connection
+# --- Azure OpenAI connection ---
 client = OpenAI(
     base_url=os.environ["AZURE_OPENAI_ENDPOINT"],
     api_key=os.environ["AZURE_OPENAI_KEY"],
 )
 DEPLOYMENT = os.environ["AZURE_OPENAI_DEPLOYMENT"]
 
-# Azure AI Content Safety (Prompt Shields) settings 
-# Read Key and Endpoint
+# --- Azure AI Content Safety (Prompt Shields) settings ---
 CONTENT_SAFETY_ENDPOINT = os.environ["CONTENT_SAFETY_ENDPOINT"].rstrip("/")
 CONTENT_SAFETY_KEY = os.environ["CONTENT_SAFETY_KEY"]
 
+# Load your trained Layer 3 classifier once, when the app starts.
+classifier = joblib.load("classifier.joblib")
 
-# ------------------------------------------------------------------
-# INBOUND GUARD — LAYER 1: known-attack pattern check
-# ------------------------------------------------------------------
+# ==================================================================
+# INBOUND GUARD  (unchanged from Phase 3)
+# ==================================================================
 INJECTION_PATTERNS = [
     "ignore previous instructions",
     "ignore all previous instructions",
@@ -52,84 +55,151 @@ def check_patterns(message: str):
     return False, ""
 
 
-# ------------------------------------------------------------------
-# INBOUND GUARD — LAYER 2: Azure AI Content Safety Prompt Shields
-# ------------------------------------------------------------------
 def check_prompt_shield(message: str):
-    """
-    Layer 2: send the message to Microsoft's Prompt Shields service, which uses
-    machine learning to detect injection/jailbreak attempts that Layer 1 misses.
-
-    Returns (is_blocked, reason), same shape as Layer 1 so the two combine cleanly.
-    """
-    # The Prompt Shields endpoint. The api-version is the current supported one;
-    # if Azure ever rejects it, this is the value to update.
+    """Layer 2: ask Azure Prompt Shields whether this looks like an attack."""
     url = f"{CONTENT_SAFETY_ENDPOINT}/contentsafety/text:shieldPrompt?api-version=2024-09-01"
-
-    # The key goes in this header. "Content-Type" tells the service we're sending JSON.
     headers = {
         "Ocp-Apim-Subscription-Key": CONTENT_SAFETY_KEY,
         "Content-Type": "application/json",
     }
-
-    # "userPrompt" is the message we want analyzed. We send no documents here.
     body = {"userPrompt": message, "documents": []}
-
     try:
-        # Call the service. timeout stops us hanging forever if Azure is slow.
         response = requests.post(url, headers=headers, json=body, timeout=10)
-        response.raise_for_status()          # raise an error on a bad HTTP status
-        result = response.json()             # turn the JSON reply into a Python dict
-
-        # The reply looks like: {"userPromptAnalysis": {"attackDetected": true/false}, ...}
-        attack_detected = result["userPromptAnalysis"]["attackDetected"]
-
-        if attack_detected:
+        response.raise_for_status()
+        result = response.json()
+        if result["userPromptAnalysis"]["attackDetected"]:
             return True, "layer2 Prompt Shields flagged an attack"
         return False, ""
-
     except Exception as e:
+        # Fail closed: if the safety check breaks, block rather than allow.
         print(f"[LAYER2 ERROR] {e}")
         return True, "layer2 check failed, blocking to be safe"
 
+def check_classifier(message: str):
+    """
+    Layer 3: your own trained model's opinion on the message.
+    predict() returns 1 for attack, 0 for safe.
+    predict_proba() gives how confident it is, which we include in the reason.
+    """
+    prediction = classifier.predict([message])[0]
+    if prediction == 1:
+        confidence = classifier.predict_proba([message])[0][1]
+        return True, f"layer3 classifier flagged attack (confidence {confidence:.2f})"
+    return False, ""
 
 def check_inbound(message: str):
-    """
-    Runs the inbound guard layers in order, cheapest first.
-    If any layer blocks, we stop and return its decision immediately.
-    """
-    # Layer 1: fast local pattern check
-    blocked, reason = check_patterns(message)
+    """Run the inbound layers in order."""
+    blocked, reason = check_patterns(message)       # Layer 1
     if blocked:
         return True, reason
 
-    # Layer 2: ML-based Prompt Shields check
-    blocked, reason = check_prompt_shield(message)
+    blocked, reason = check_prompt_shield(message)  # Layer 2
     if blocked:
         return True, reason
 
-    # Passed every layer
+    blocked, reason = check_classifier(message)     # Layer 3 
+    if blocked:
+        return True, reason
+
     return False, ""
 
 
-# --- Request shape  ---
+# ==================================================================
+# OUTBOUND GUARD  (NEW in Phase 4)
+# ==================================================================
+# Each entry is a label plus a regular expression that matches that kind of
+# personal data. A regex is just a pattern: \d means "a digit", {4} means
+# "exactly four of them", and so on. You don't need to memorize these — the
+# comments explain what each one catches.
+PII_PATTERNS = {
+    # name@example.com
+    "EMAIL": r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+    # 123-45-6789  (US Social Security Number)
+    "SSN": r"\b\d{3}-\d{2}-\d{4}\b",
+    # 1234 5678 9012 3456  (16-digit card, spaces or dashes optional)
+    "CREDIT_CARD": r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b",
+    # (555) 123-4567  /  555-123-4567  /  +1 555 123 4567
+    "PHONE": r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",
+}
+
+
+def scan_and_redact_pii(text: str):
+    """
+    Look through the model's reply for personal data and black it out.
+
+    Returns:
+      - cleaned:    the reply with any PII replaced by [REDACTED ...]
+      - redactions: a list of the kinds of PII we found (e.g. ["EMAIL"])
+    We redact CREDIT_CARD and SSN before PHONE so a card number isn't
+    partly matched as a phone number.
+    """
+    cleaned = text
+    redactions = []
+    for label, pattern in PII_PATTERNS.items():
+        if re.search(pattern, cleaned):          # is there at least one match?
+            cleaned = re.sub(pattern, f"[REDACTED {label}]", cleaned)  # replace all matches
+            redactions.append(label)
+    return cleaned, redactions
+
+
+# Phrases that suggest the model may have been tricked into revealing its setup.
+LEAK_MARKERS = [
+    "my system prompt",
+    "my instructions are",
+    "i was instructed to",
+    "here are my instructions",
+    "my initial prompt",
+]
+
+
+def check_response_hijacked(text: str):
+    """Light check: does the reply look like it's leaking its own instructions?"""
+    lowered = text.lower()
+    for marker in LEAK_MARKERS:
+        if marker in lowered:
+            return True
+    return False
+
+
+def check_outbound(reply: str):
+    """
+    Run the outbound guard on the model's reply.
+
+    Returns:
+      - final_reply: the reply after PII redaction (safe to send to the user)
+      - info:        a small dict describing what the guard found/did
+    """
+    final_reply, redactions = scan_and_redact_pii(reply)
+    possible_leak = check_response_hijacked(final_reply)
+    info = {"pii_redacted": redactions, "possible_leak": possible_leak}
+    return final_reply, info
+
+
+# --- Request shape (unchanged) ---
 class ChatRequest(BaseModel):
     message: str
 
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-    # Run the full inbound guard BEFORE calling the model.
+    # 1) INBOUND GUARD — check the request before calling the model.
     is_blocked, reason = check_inbound(request.message)
-
     if is_blocked:
         print(f"[BLOCKED] {reason} | message={request.message!r}")
         return {"blocked": True, "reason": reason, "reply": None}
 
-    # Clean message -> call the model as normal.
+    # 2) Call the model.
     print(f"[ALLOWED] message={request.message!r}")
     response = client.chat.completions.create(
         model=DEPLOYMENT,
         messages=[{"role": "user", "content": request.message}],
     )
-    return {"blocked": False, "reason": None, "reply": response.choices[0].message.content}
+    reply = response.choices[0].message.content
+
+    # 3) OUTBOUND GUARD — check the model's answer before returning it.
+    final_reply, outbound = check_outbound(reply)
+    if outbound["pii_redacted"] or outbound["possible_leak"]:
+        print(f"[OUTBOUND] redacted={outbound['pii_redacted']} leak={outbound['possible_leak']}")
+
+    # 4) Return the cleaned reply plus a note about what the outbound guard did.
+    return {"blocked": False, "reason": None, "reply": final_reply, "outbound": outbound}
