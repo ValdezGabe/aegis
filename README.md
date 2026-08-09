@@ -48,3 +48,11 @@ known attacks blocked at Layer 1, and novel attacks blocked at Layer 2.
 - Outbound guard: scan model responses for data leakage
 - Deploy to Azure with managed identity and a private endpoint
 - Stream decisions to Microsoft Sentinel for detection
+
+
+
+
+az containerapp secret set \
+  --name aegis-gateway \
+  --resource-group rg-aegis-dev \
+  --secrets openai-key=CiogC7DCOl5iT4uc5nn0IVRMpWHDh6jhizbiCbgxA0TbFLEE7OwGJQQJ99CHACMsfrFXJ3w3AAABACOG9C3x contentsafety-key=1k3i652Ut10fnb3zdETqcE8y752K7mpvWvzbLo2A1pItiIZrhBD7JQQJ99CHAC8vTInXJ3w3AAAHACOGLm0T
