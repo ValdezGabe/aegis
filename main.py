@@ -1,33 +1,31 @@
 import os
-import re                              # NEW: regular expressions, used to find PII patterns
+import re              
 import requests
 import joblib
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
 
-load_dotenv()  # load endpoint, key, deployment from your .env file
+load_dotenv()  
 
 app = FastAPI()
 
-# --- Azure OpenAI connection ---
+# Azure OpenAI connection 
 client = OpenAI(
     base_url=os.environ["AZURE_OPENAI_ENDPOINT"],
     api_key=os.environ["AZURE_OPENAI_KEY"],
 )
 DEPLOYMENT = os.environ["AZURE_OPENAI_DEPLOYMENT"]
 
-# --- Azure AI Content Safety (Prompt Shields) settings ---
+# Azure AI Content Safety (Prompt Shields) settings
 CONTENT_SAFETY_ENDPOINT = os.environ["CONTENT_SAFETY_ENDPOINT"].rstrip("/")
 CONTENT_SAFETY_KEY = os.environ["CONTENT_SAFETY_KEY"]
 
 # Load your trained Layer 3 classifier once, when the app starts.
 classifier = joblib.load("classifier.joblib")
 
-# ==================================================================
-# INBOUND GUARD  (unchanged from Phase 3)
-# ==================================================================
+# INBOUND GUARD 
 INJECTION_PATTERNS = [
     "ignore previous instructions",
     "ignore all previous instructions",
@@ -105,7 +103,7 @@ def check_inbound(message: str):
 
 
 # ==================================================================
-# OUTBOUND GUARD  (NEW in Phase 4)
+# OUTBOUND GUARD 
 # ==================================================================
 # Each entry is a label plus a regular expression that matches that kind of
 # personal data. A regex is just a pattern: \d means "a digit", {4} means
@@ -175,13 +173,15 @@ def check_outbound(reply: str):
     return final_reply, info
 
 
-# --- Request shape (unchanged) ---
+# Request shape 
 class ChatRequest(BaseModel):
     message: str
 
 
 @app.post("/chat")
-def chat(request: ChatRequest):
+def chat(request: ChatRequest, http_request: Request):
+    user = http_request.headers.get("x-ms-client-principal-name", "anonymous")
+    print(f"[USER] {user}")
     # 1) INBOUND GUARD — check the request before calling the model.
     is_blocked, reason = check_inbound(request.message)
     if is_blocked:
