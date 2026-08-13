@@ -1,11 +1,13 @@
 import os
-import re              
+import re
 import requests
 import joblib
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
+
+import agent_firewall
 
 load_dotenv()  
 
@@ -203,3 +205,86 @@ def chat(request: ChatRequest, http_request: Request):
 
     # 4) Return the cleaned reply plus a note about what the outbound guard did.
     return {"blocked": False, "reason": None, "reply": final_reply, "outbound": outbound}
+
+
+# ==================================================================
+# AGENTIC TOOL-CALL FIREWALL
+# ==================================================================
+# The /chat guard above protects a conversation. The /agent guard below protects
+# an *action*: before an AI agent runs a tool (read a file, fetch a URL, run a
+# shell command), the intended call passes through the checks in
+# agent_firewall.py. Only calls that survive every check are allowed to execute.
+
+# A global emergency stop. Set AEGIS_KILL_SWITCH=on in the environment to deny
+# every tool call at once — useful if an agent starts misbehaving in production.
+agent_firewall.KILL_SWITCH = os.environ.get("AEGIS_KILL_SWITCH", "").lower() in (
+    "on",
+    "true",
+    "1",
+)
+
+
+# Tool arguments are short and often structured (file paths, IDs, recipients),
+# so the classifier's default 0.50 decision point produces borderline false
+# positives on harmless values. For the action layer we require higher
+# confidence before blocking on the classifier alone; Layer 1's exact-phrase
+# match is unaffected and still fires on known attacks at any confidence.
+AGENT_INJECTION_THRESHOLD = 0.70
+
+
+def scan_arguments_for_injection(text: str):
+    """
+    Reuse the chat guard's detection on tool arguments. We run Layer 1 (pattern
+    match) and Layer 3 (trained classifier) — the two local, no-network checks —
+    so an injected instruction hidden inside a tool argument is caught by the
+    same models that protect the chat endpoint. The classifier uses a higher
+    confidence threshold here (see AGENT_INJECTION_THRESHOLD) to avoid false
+    positives on short structured arguments.
+    """
+    blocked, reason = check_patterns(text)      # Layer 1: exact attack phrases
+    if blocked:
+        return True, reason
+
+    confidence = classifier.predict_proba([text])[0][1]   # Layer 3
+    if confidence >= AGENT_INJECTION_THRESHOLD:
+        return True, f"layer3 classifier flagged attack (confidence {confidence:.2f})"
+    return False, ""
+
+
+class ToolCallRequest(BaseModel):
+    tool: str
+    arguments: dict = {}
+
+
+@app.post("/agent")
+def agent(request: ToolCallRequest, http_request: Request):
+    """
+    Guard a single agent tool call.
+
+    The body describes what the agent wants to do, e.g.:
+        {"tool": "http_get", "arguments": {"url": "https://example.com"}}
+
+    The firewall returns whether the call is allowed, which control decided it,
+    and why. A caller (the agent runtime) should execute the tool only when
+    "allowed" is true.
+    """
+    identity = http_request.headers.get("x-ms-client-principal-name", "anonymous")
+
+    decision = agent_firewall.evaluate_tool_call(
+        tool=request.tool,
+        arguments=request.arguments,
+        identity=identity,
+        injection_scan=scan_arguments_for_injection,
+    )
+
+    # Audit log: every allow/block decision, who made it, and why. This is the
+    # repudiation control for the action layer — a record of what each identity
+    # tried to do and how the gateway ruled on it.
+    status = "ALLOWED" if decision["allowed"] else "BLOCKED"
+    print(
+        f"[AGENT {status}] identity={identity} tool={request.tool!r} "
+        f"control={decision['control']} reason={decision['reason']!r} "
+        f"args={request.arguments!r}"
+    )
+
+    return decision

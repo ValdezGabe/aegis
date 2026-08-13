@@ -76,6 +76,11 @@ identity, and every allow/block decision is logged.
   holding a least-privilege *Key Vault Secrets User* role.
 - **Authentication** — Microsoft Entra ID sign-in required to reach the gateway.
 - **Decision logging** — allow/block decisions written to Log Analytics.
+- **Agentic tool-call firewall** — the `/agent` endpoint guards *actions*, not
+  just words. Before an agent runs a tool it passes a least-privilege allowlist,
+  a per-identity rate limit, an argument injection scan, per-tool argument policy
+  (SSRF, path traversal, sensitive-file, destructive-shell), a human-in-the-loop
+  approval gate for high-impact tools, and a global kill switch. See below.
 
 ### Designed as next hardening steps (not yet deployed)
 
@@ -103,16 +108,64 @@ demonstration while relying on authentication and the guard layers.
 
 ---
 
+## Agentic tool-call firewall
+
+The chat guard protects a *conversation*. But an AI agent doesn't just talk — it
+*acts*: it reads files, calls APIs, runs commands, sends email. Every action is a
+place an attacker or a confused model can cause real damage. The `/agent`
+endpoint is a firewall for those actions.
+
+A caller sends the *intended* tool call — the tool name and its arguments — and
+the firewall returns an allow/deny decision plus the control that decided it. The
+agent runtime executes the tool only on an allow.
+
+```mermaid
+flowchart LR
+    agent([AI agent]) -->|"tool + arguments"| fw{Agent firewall}
+    fw --> k[Kill switch]
+    k --> rl[Rate limit<br/>per identity]
+    rl --> al[Least-privilege<br/>allowlist]
+    al --> inj[Argument<br/>injection scan]
+    inj --> pol[Per-tool policy<br/>SSRF · traversal · shell]
+    pol --> appr[Approval gate<br/>high-impact tools]
+    appr -->|allow| exec[(Tool executes)]
+    k -.->|deny| block[(Blocked + logged)]
+    rl -.->|deny| block
+    al -.->|deny| block
+    inj -.->|deny| block
+    pol -.->|deny| block
+    appr -.->|deny: pending approval| block
+```
+
+Checks run cheapest-and-most-severe first. Each maps to a risk in the **OWASP
+Top 10 for Agentic Applications (2026)**:
+
+| Control | What it stops | OWASP Agentic risk |
+|---|---|---|
+| **Kill switch** | Emergency stop for all agent action | Excessive agency |
+| **Rate limit** (per identity) | Runaway loops draining quota / amplifying attacks | Excessive agency / resource abuse |
+| **Least-privilege allowlist** | Agent invoking a tool it should never have | Excessive agency / tool misuse |
+| **Argument injection scan** | Injected instructions smuggled inside tool arguments | Prompt injection reaching the action layer |
+| **Per-tool argument policy** | SSRF to internal hosts / cloud metadata, path traversal, sensitive-file reads, destructive shell | Privilege escalation via unsafe arguments |
+| **Approval gate** | Auto-execution of high-impact tools (`write_file`, `run_shell`, `send_email`) | Missing human-in-the-loop |
+
+The SSRF check blocks loopback, private, link-local, and reserved IP ranges plus
+the cloud metadata endpoint (`169.254.169.254`) and named metadata hosts — the
+classic path an agent is tricked into handing out instance credentials. DNS
+resolution of hostnames (DNS-rebinding defense) is the documented next step.
+
+---
+
 ## STRIDE threat model
 
 | Threat | Example | Mitigation | Status |
 |---|---|---|---|
 | **Spoofing** | Anonymous user hits the gateway | Microsoft Entra ID authentication required | Implemented |
-| **Tampering** | Prompt injection overrides the model's instructions | Three-layer inbound guard (patterns, Prompt Shields, trained classifier) | Implemented |
-| **Repudiation** | No record of who did what | Allow/block decision logging to Log Analytics; Sentinel + identity correlation | Partial / planned |
-| **Information disclosure** | Model leaks PII or is reached directly | Outbound PII redaction and leak check (implemented); private endpoint with public access disabled (planned) | Partial |
-| **Denial of service** | Flood of requests exhausts the model quota | Container Apps autoscaling; per-identity rate limiting | Partial / planned |
-| **Elevation of privilege** | Stolen API key used elsewhere | No keys in app; managed identity + Key Vault with least-privilege RBAC | Implemented |
+| **Tampering** | Prompt injection overrides the model's instructions, or is smuggled into a tool argument | Three-layer inbound guard (patterns, Prompt Shields, trained classifier); argument injection scan on the `/agent` action layer | Implemented |
+| **Repudiation** | No record of who did what | Allow/block decision logging to Log Analytics for both chat and tool-call decisions; Sentinel + identity correlation | Partial / planned |
+| **Information disclosure** | Model leaks PII, is reached directly, or an agent is tricked into SSRF against cloud metadata | Outbound PII redaction and leak check; agent firewall blocks SSRF, path traversal, and sensitive-file reads (implemented); private endpoint with public access disabled (planned) | Partial |
+| **Denial of service** | Flood of requests, or a runaway agent loop, exhausts the model quota | Container Apps autoscaling (planned); per-identity tool-call rate limiting on the `/agent` layer (implemented) | Partial |
+| **Elevation of privilege** | Stolen API key used elsewhere, or an agent runs a tool / command it should not | No keys in app; managed identity + Key Vault least-privilege RBAC; least-privilege tool allowlist, destructive-shell block, and human-in-the-loop approval gate on the agent layer | Implemented |
 
 ---
 
