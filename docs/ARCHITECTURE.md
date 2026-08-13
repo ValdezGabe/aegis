@@ -156,13 +156,59 @@ resolution of hostnames (DNS-rebinding defense) is the documented next step.
 
 ---
 
+## Observability
+
+A gateway that can't be observed can't be operated. Aegis is instrumented with
+**OpenTelemetry**, the vendor-neutral cloud-native standard, emitting both traces
+and metrics so an operator can answer, in production: which layer blocked a
+request, where the latency went, and whether one identity is being blocked over
+and over.
+
+### Traces
+
+Every request is a span tree. The FastAPI server span is created automatically;
+nested inside it, Aegis opens a span per guard stage:
+
+- `/chat`: `guard.layer1` → `guard.layer2` → `guard.layer3` → `model.call` → `guard.outbound`
+- `/agent`: `agent.tool_call`
+
+Each span carries decision attributes — `aegis.decision` (allowed/blocked),
+`aegis.blocked_layer` or `aegis.control`, `aegis.tool`, `aegis.pii_redacted`, and
+`aegis.layer.latency_ms` — so a trace is searchable by outcome and shows exactly
+where a blocked request stopped and how long each check took.
+
+### Metrics
+
+| Instrument | Type | Labels | Answers |
+|---|---|---|---|
+| `aegis.requests` | counter | endpoint, decision | Request volume and allow/block rate per surface |
+| `aegis.blocks` | counter | layer/control | Which layer or agentic control is doing the blocking |
+| `aegis.pii_redactions` | counter | type | How much PII the outbound guard is catching, by kind |
+| `aegis.layer.latency` | histogram | layer | p50/p99 latency per guard layer |
+
+### Export
+
+The exporter is chosen from the environment, so the same container image is
+portable across environments:
+
+- `OTEL_EXPORTER_OTLP_ENDPOINT` set → OTLP to Grafana Tempo/Mimir, Jaeger, or an
+  OpenTelemetry Collector (the portable default).
+- unset → console exporter, so traces and metrics are visible in local dev.
+- **Azure Monitor / Application Insights** (opt-in) → add the
+  `azure-monitor-opentelemetry` distro and set
+  `APPLICATIONINSIGHTS_CONNECTION_STRING` to keep telemetry in the same Azure
+  tenant as the existing Log Analytics decision logs, correlated with the
+  Container App and managed identity.
+
+---
+
 ## STRIDE threat model
 
 | Threat | Example | Mitigation | Status |
 |---|---|---|---|
 | **Spoofing** | Anonymous user hits the gateway | Microsoft Entra ID authentication required | Implemented |
 | **Tampering** | Prompt injection overrides the model's instructions, or is smuggled into a tool argument | Three-layer inbound guard (patterns, Prompt Shields, trained classifier); argument injection scan on the `/agent` action layer | Implemented |
-| **Repudiation** | No record of who did what | Allow/block decision logging to Log Analytics for both chat and tool-call decisions; Sentinel + identity correlation | Partial / planned |
+| **Repudiation** | No record of who did what | Allow/block decision logging to Log Analytics for both chat and tool-call decisions; OpenTelemetry traces/metrics tag every decision with identity, layer, and outcome; Sentinel + identity correlation | Partial / planned |
 | **Information disclosure** | Model leaks PII, is reached directly, or an agent is tricked into SSRF against cloud metadata | Outbound PII redaction and leak check; agent firewall blocks SSRF, path traversal, and sensitive-file reads (implemented); private endpoint with public access disabled (planned) | Partial |
 | **Denial of service** | Flood of requests, or a runaway agent loop, exhausts the model quota | Container Apps autoscaling (planned); per-identity tool-call rate limiting on the `/agent` layer (implemented) | Partial |
 | **Elevation of privilege** | Stolen API key used elsewhere, or an agent runs a tool / command it should not | No keys in app; managed identity + Key Vault least-privilege RBAC; least-privilege tool allowlist, destructive-shell block, and human-in-the-loop approval gate on the agent layer | Implemented |

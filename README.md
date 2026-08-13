@@ -34,9 +34,18 @@ Applications (2026)**:
 
 Every allow/block decision is logged with the identity, tool, and the control that decided it.
 
+### Observability (OpenTelemetry)
+
+Both surfaces are instrumented with [OpenTelemetry](https://opentelemetry.io), the cloud-native standard for traces and metrics:
+
+- **Traces** — each request is a span tree: a span per guard layer (`guard.layer1/2/3`, `guard.outbound`, `model.call`, `agent.tool_call`), tagged with the decision, the deciding layer/control, and per-layer latency. Answers "which layer blocked this, and where did the time go?"
+- **Metrics** — counters (`aegis.requests`, `aegis.blocks`, `aegis.pii_redactions`) and a per-layer latency histogram (`aegis.layer.latency`), so you get block rate by layer and p50/p99 latency per check.
+
+Export is chosen from the environment: set `OTEL_EXPORTER_OTLP_ENDPOINT` to ship to Grafana / Jaeger / an OpenTelemetry Collector; unset, it prints to the console for local dev. Azure Monitor is an opt-in path (see [ARCHITECTURE.md](docs/ARCHITECTURE.md)).
+
 ## Tech
 
-Python, FastAPI, Azure OpenAI, Azure AI Content Safety, scikit-learn, Docker, Azure Container Apps, Key Vault, Entra ID, Bicep. Agentic controls mapped to the OWASP Top 10 for Agentic Applications (2026).
+Python, FastAPI, Azure OpenAI, Azure AI Content Safety, scikit-learn, OpenTelemetry, Docker, Azure Container Apps, Key Vault, Entra ID, Bicep. Agentic controls mapped to the OWASP Top 10 for Agentic Applications (2026).
 
 ## Run locally
 

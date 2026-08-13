@@ -6,12 +6,18 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
+from opentelemetry import trace
 
 import agent_firewall
+import telemetry
 
-load_dotenv()  
+load_dotenv()
 
 app = FastAPI()
+
+# Wire OpenTelemetry: traces + metrics for every guard layer, exported to an
+# OTLP backend (Grafana/Jaeger/Collector) or the console in local dev.
+telemetry.setup_telemetry(app)
 
 # Azure OpenAI connection 
 client = OpenAI(
@@ -88,20 +94,28 @@ def check_classifier(message: str):
     return False, ""
 
 def check_inbound(message: str):
-    """Run the inbound layers in order."""
-    blocked, reason = check_patterns(message)       # Layer 1
+    """
+    Run the inbound layers in order. Each layer runs inside its own telemetry
+    span so a trace shows the timeline of the request through the guard, and the
+    latency histogram can break time down per layer. Returns (blocked, reason,
+    layer) where `layer` names the check that blocked, or None if all passed.
+    """
+    with telemetry.layer_span("guard.layer1", "layer1"):
+        blocked, reason = check_patterns(message)       # Layer 1
     if blocked:
-        return True, reason
+        return True, reason, "layer1"
 
-    blocked, reason = check_prompt_shield(message)  # Layer 2
+    with telemetry.layer_span("guard.layer2", "layer2"):
+        blocked, reason = check_prompt_shield(message)  # Layer 2
     if blocked:
-        return True, reason
+        return True, reason, "layer2"
 
-    blocked, reason = check_classifier(message)     # Layer 3 
+    with telemetry.layer_span("guard.layer3", "layer3"):
+        blocked, reason = check_classifier(message)     # Layer 3
     if blocked:
-        return True, reason
+        return True, reason, "layer3"
 
-    return False, ""
+    return False, "", None
 
 
 # ==================================================================
@@ -183,25 +197,39 @@ class ChatRequest(BaseModel):
 @app.post("/chat")
 def chat(request: ChatRequest, http_request: Request):
     user = http_request.headers.get("x-ms-client-principal-name", "anonymous")
+    span = trace.get_current_span()  # the auto-created FastAPI server span
     print(f"[USER] {user}")
+
     # 1) INBOUND GUARD — check the request before calling the model.
-    is_blocked, reason = check_inbound(request.message)
+    is_blocked, reason, layer = check_inbound(request.message)
     if is_blocked:
         print(f"[BLOCKED] {reason} | message={request.message!r}")
+        span.set_attribute("aegis.decision", "blocked")
+        span.set_attribute("aegis.blocked_layer", layer)
+        telemetry.count(telemetry.requests_total, attributes={"endpoint": "/chat", "decision": "blocked"})
+        telemetry.count(telemetry.blocks_total, attributes={"layer": layer})
         return {"blocked": True, "reason": reason, "reply": None}
 
     # 2) Call the model.
     print(f"[ALLOWED] message={request.message!r}")
-    response = client.chat.completions.create(
-        model=DEPLOYMENT,
-        messages=[{"role": "user", "content": request.message}],
-    )
+    with telemetry.layer_span("model.call", "model"):
+        response = client.chat.completions.create(
+            model=DEPLOYMENT,
+            messages=[{"role": "user", "content": request.message}],
+        )
     reply = response.choices[0].message.content
 
     # 3) OUTBOUND GUARD — check the model's answer before returning it.
-    final_reply, outbound = check_outbound(reply)
+    with telemetry.layer_span("guard.outbound", "outbound"):
+        final_reply, outbound = check_outbound(reply)
     if outbound["pii_redacted"] or outbound["possible_leak"]:
         print(f"[OUTBOUND] redacted={outbound['pii_redacted']} leak={outbound['possible_leak']}")
+        for pii_type in outbound["pii_redacted"]:
+            telemetry.count(telemetry.pii_redactions_total, attributes={"type": pii_type})
+
+    span.set_attribute("aegis.decision", "allowed")
+    span.set_attribute("aegis.pii_redacted", len(outbound["pii_redacted"]))
+    telemetry.count(telemetry.requests_total, attributes={"endpoint": "/chat", "decision": "allowed"})
 
     # 4) Return the cleaned reply plus a note about what the outbound guard did.
     return {"blocked": False, "reason": None, "reply": final_reply, "outbound": outbound}
@@ -270,12 +298,24 @@ def agent(request: ToolCallRequest, http_request: Request):
     """
     identity = http_request.headers.get("x-ms-client-principal-name", "anonymous")
 
-    decision = agent_firewall.evaluate_tool_call(
-        tool=request.tool,
-        arguments=request.arguments,
-        identity=identity,
-        injection_scan=scan_arguments_for_injection,
-    )
+    with telemetry.layer_span("agent.tool_call", "agent"):
+        decision = agent_firewall.evaluate_tool_call(
+            tool=request.tool,
+            arguments=request.arguments,
+            identity=identity,
+            injection_scan=scan_arguments_for_injection,
+        )
+
+    # Tag the trace with the decision so a tool call is searchable by tool,
+    # outcome, and the control that decided it.
+    span = trace.get_current_span()
+    outcome = "allowed" if decision["allowed"] else "blocked"
+    span.set_attribute("aegis.tool", request.tool)
+    span.set_attribute("aegis.decision", outcome)
+    span.set_attribute("aegis.control", decision["control"])
+    telemetry.count(telemetry.requests_total, attributes={"endpoint": "/agent", "decision": outcome})
+    if not decision["allowed"]:
+        telemetry.count(telemetry.blocks_total, attributes={"layer": decision["control"]})
 
     # Audit log: every allow/block decision, who made it, and why. This is the
     # repudiation control for the action layer — a record of what each identity

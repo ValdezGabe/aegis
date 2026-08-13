@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the app code and the trained model into the image.
 COPY main.py .
 COPY agent_firewall.py .
+COPY telemetry.py .
 COPY classifier.joblib .
 
 # Tell Azure which port the app listens on (it reads this line).
