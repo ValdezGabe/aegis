@@ -1,7 +1,10 @@
 # train_classifier.py
 # Trains a prompt-injection detector (TF-IDF + Logistic Regression) on the
 # public deepset/prompt-injections dataset, reports precision/recall on a
-# held-out test set, and saves the model to classifier.joblib for the gateway.
+# held-out test set, and saves the model to models/classifier.joblib for the
+# gateway.
+
+from pathlib import Path
 
 from datasets import load_dataset
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -43,6 +46,9 @@ print("Confusion matrix (rows = truth, columns = prediction):")
 print(confusion_matrix(y_test, y_pred))
 print("\n=========================================\n")
 
-# Save trained model
-joblib.dump(model, "classifier.joblib")
-print("Saved trained model to classifier.joblib")
+# Save trained model into models/ at the repo root, which is where the gateway
+# loads it from at startup.
+MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "classifier.joblib"
+MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+joblib.dump(model, MODEL_PATH)
+print(f"Saved trained model to {MODEL_PATH}")

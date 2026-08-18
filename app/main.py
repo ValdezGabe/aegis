@@ -1,5 +1,7 @@
 import os
-import re              
+import re
+from pathlib import Path
+
 import requests
 import joblib
 from fastapi import FastAPI, Request
@@ -22,8 +24,12 @@ DEPLOYMENT = os.environ["AZURE_OPENAI_DEPLOYMENT"]
 CONTENT_SAFETY_ENDPOINT = os.environ["CONTENT_SAFETY_ENDPOINT"].rstrip("/")
 CONTENT_SAFETY_KEY = os.environ["CONTENT_SAFETY_KEY"]
 
-# Load your trained Layer 3 classifier once, when the app starts.
-classifier = joblib.load("classifier.joblib")
+# Load the trained Layer 3 classifier once, when the app starts.
+# Default path is models/classifier.joblib next to this package; override with
+# CLASSIFIER_PATH if the model lives somewhere else.
+DEFAULT_CLASSIFIER_PATH = Path(__file__).resolve().parent.parent / "models" / "classifier.joblib"
+CLASSIFIER_PATH = os.environ.get("CLASSIFIER_PATH", str(DEFAULT_CLASSIFIER_PATH))
+classifier = joblib.load(CLASSIFIER_PATH)
 
 # INBOUND GUARD 
 INJECTION_PATTERNS = [
